@@ -1,0 +1,175 @@
+"""Dessiner avec les gestes devant la webcam.
+
+Installation : pip install opencv-python mediapipe numpy
+Lancement : python dessin_camera.py
+
+Levez l'index seul pour dessiner. Pincez le pouce et l'index sur un bouton
+en haut à gauche pour le sélectionner : Continuer efface et recommence,
+Finaliser verrouille le dessin et affiche une reconnaissance approximative.
+Appuyez sur Q pour quitter.
+"""
+
+import cv2
+import mediapipe as mp
+import numpy as np
+from pathlib import Path
+
+WIDTH, HEIGHT = 960, 720
+
+
+def create_launchers():
+    """Crée les deux lanceurs à côté de ce script."""
+    folder = Path(__file__).resolve().parent
+    script_name = Path(__file__).name
+
+    linux = folder / "lancer_linux.sh"
+    linux.write_text(
+        "#!/bin/sh\n"
+        'cd "$(dirname "$0")" || exit 1\n'
+        "python3 -m venv .venv || exit 1\n"
+        ".venv/bin/python -m pip install opencv-python mediapipe numpy || exit 1\n"
+        f'exec .venv/bin/python "{script_name}"\n',
+        encoding="utf-8",
+    )
+    linux.chmod(0o755)
+
+    windows = folder / "lancer_windows.bat"
+    windows.write_text(
+        "@echo off\r\n"
+        "cd /d \"%~dp0\"\r\n"
+        "py -m venv .venv || exit /b 1\r\n"
+        ".venv\\Scripts\\python.exe -m pip install opencv-python mediapipe numpy || exit /b 1\r\n"
+        f'.venv\\Scripts\\python.exe "{script_name}"\r\n'
+        "pause\r\n",
+        encoding="utf-8",
+    )
+
+
+def recognize_shape(canvas):
+    gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return "Aucun dessin détecté"
+    contour = max(contours, key=cv2.contourArea)
+    perimeter = cv2.arcLength(contour, True)
+    if perimeter == 0:
+        return "Forme non reconnue"
+    corners = cv2.approxPolyDP(contour, 0.035 * perimeter, True)
+    count = len(corners)
+    if count == 3:
+        return "Triangle"
+    if count == 4:
+        _, _, w, h = cv2.boundingRect(corners)
+        return "Carré" if 0.85 <= w / max(h, 1) <= 1.15 else "Rectangle"
+    if count >= 7:
+        return "Cercle / forme arrondie"
+    return f"Forme d'environ {count} côtés"
+
+
+def main():
+    create_launchers()
+    camera = cv2.VideoCapture(0)
+    if not camera.isOpened():
+        print("Caméra inaccessible. Vérifiez qu'elle est branchée et autorisée.")
+        return
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+
+    canvas = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    drawing = False
+    finalized = False
+    message = ""
+    held_button = None
+    hold_count = 0
+    cooldown = 0
+    buttons = {
+        "continuer": (20, 20, 190, 78),
+        "finaliser": (205, 20, 380, 78),
+    }
+
+    with mp.solutions.hands.Hands(
+        max_num_hands=1,
+        min_detection_confidence=0.65,
+        min_tracking_confidence=0.6,
+    ) as hands:
+        while True:
+            ok, frame = camera.read()
+            if not ok:
+                print("Impossible de lire l'image de la caméra.")
+                break
+            frame = cv2.flip(cv2.resize(frame, (WIDTH, HEIGHT)), 1)
+            landmarks = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).multi_hand_landmarks
+            tip = None
+            pinching = False
+            index_only = False
+            if landmarks:
+                points = landmarks[0].landmark
+                tip = (int(points[8].x * WIDTH), int(points[8].y * HEIGHT))
+                thumb = (int(points[4].x * WIDTH), int(points[4].y * HEIGHT))
+                pinching = np.hypot(tip[0] - thumb[0], tip[1] - thumb[1]) < 38
+                index_only = (
+                    points[8].y < points[6].y
+                    and points[12].y > points[10].y
+                    and points[16].y > points[14].y
+                    and points[20].y > points[18].y
+                )
+                cv2.circle(frame, tip, 8, (0, 255, 255), -1)
+
+            selected = None
+            if tip is not None and pinching:
+                for name, (x1, y1, x2, y2) in buttons.items():
+                    if x1 <= tip[0] <= x2 and y1 <= tip[1] <= y2:
+                        selected = name
+                        break
+            if cooldown:
+                cooldown -= 1
+            if selected:
+                hold_count = hold_count + 1 if selected == held_button else 1
+                held_button = selected
+                if hold_count >= 12 and cooldown == 0:
+                    if selected == "continuer":
+                        canvas[:] = 0
+                        finalized = False
+                        message = ""
+                    else:
+                        finalized = True
+                        message = recognize_shape(canvas)
+                    cooldown = 20
+                    hold_count = 0
+            else:
+                held_button = None
+                hold_count = 0
+
+            over_button = tip is not None and any(
+                x1 <= tip[0] <= x2 and y1 <= tip[1] <= y2
+                for x1, y1, x2, y2 in buttons.values()
+            )
+            if index_only and not pinching and not over_button and not finalized:
+                if drawing:
+                    cv2.line(canvas, previous, tip, (0, 220, 80), 6)
+                previous = tip
+                drawing = True
+            else:
+                drawing = False
+
+            output = cv2.addWeighted(frame, 0.65, canvas, 0.9, 0)
+            for name, (x1, y1, x2, y2) in buttons.items():
+                color = (45, 155, 65) if name == "continuer" else (45, 95, 210)
+                cv2.rectangle(output, (x1, y1), (x2, y2), color, -1)
+                label = "Continuer" if name == "continuer" else "Finaliser"
+                cv2.putText(output, label, (x1 + 12, y1 + 38), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            if message:
+                cv2.putText(output, message, (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2)
+            cv2.putText(output, "Index seul : dessiner | Pince pouce-index : choisir | Q : quitter",
+                        (20, HEIGHT - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
+            cv2.imshow("Dessin par gestes", output)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    camera.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
